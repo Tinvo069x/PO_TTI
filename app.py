@@ -1,12 +1,13 @@
+
 import streamlit as st
 import pandas as pd
 from datetime import datetime
 from collections import defaultdict
 import io
 
-# ===================================
+# =====================================================
 # CONFIG
-# ===================================
+# =====================================================
 
 st.set_page_config(
     page_title="PO Tracking Processor",
@@ -16,9 +17,9 @@ st.set_page_config(
 st.title("PO Tracking Processor")
 st.markdown("Upload Open CD file and generate PO Tracking report")
 
-# ===================================
-# SAFE RENAME
-# ===================================
+# =====================================================
+# HELPER FUNCTIONS
+# =====================================================
 
 def safe_rename_column(df, old_name, new_name):
 
@@ -35,13 +36,143 @@ def safe_rename_column(df, old_name, new_name):
     return df.rename(columns={old_name: target})
 
 
-# ===================================
-# PROCESS FUNCTION
-# ===================================
+def detect_month_columns(df):
+
+    month_cols = []
+
+    for col in df.columns:
+
+        try:
+
+            dt = pd.to_datetime(
+                str(col),
+                errors="raise"
+            )
+
+            if dt.year >= 2024:
+                month_cols.append(col)
+
+        except:
+            pass
+
+    return month_cols
+
+
+def calculate_runout(row, month_cols):
+
+    supply = (
+        pd.to_numeric(
+            row.get("Store_Qty", 0),
+            errors="coerce"
+        )
+        +
+        pd.to_numeric(
+            row.get("IQC_QTY", 0),
+            errors="coerce"
+        )
+        +
+        pd.to_numeric(
+            row.get("PO_QTY", 0),
+            errors="coerce"
+        )
+    )
+
+    supply = 0 if pd.isna(supply) else supply
+
+    balance = supply
+
+    for col in month_cols:
+
+        demand = pd.to_numeric(
+            row[col],
+            errors="coerce"
+        )
+
+        demand = 0 if pd.isna(demand) else demand
+
+        balance -= demand
+
+        if balance < 0:
+            return str(col)
+
+    return "999"
+
+
+def calculate_excess(row, month_cols):
+
+    supply = (
+        pd.to_numeric(
+            row.get("Store_Qty", 0),
+            errors="coerce"
+        )
+        +
+        pd.to_numeric(
+            row.get("IQC_QTY", 0),
+            errors="coerce"
+        )
+        +
+        pd.to_numeric(
+            row.get("PO_QTY", 0),
+            errors="coerce"
+        )
+    )
+
+    supply = 0 if pd.isna(supply) else supply
+
+    demand = (
+        pd.to_numeric(
+            row[month_cols],
+            errors="coerce"
+        )
+        .fillna(0)
+        .sum()
+    )
+
+    return max(
+        0,
+        supply - demand
+    )
+
+
+def calculate_classification(row, month_cols):
+
+    active_months = (
+        pd.to_numeric(
+            row[month_cols],
+            errors="coerce"
+        )
+        .fillna(0)
+        .gt(0)
+        .sum()
+    )
+
+    ratio = active_months / len(month_cols)
+
+    if ratio >= 0.8:
+        return "Fast Moving"
+
+    return "Slow Moving"
+
+
+def calculate_status(row):
+
+    runout = row["Run_out_stock_until"]
+
+    if runout == "999":
+        return "Excess PO"
+
+    return "Follow"
+
+
+# =====================================================
+# MAIN PROCESS
+# =====================================================
 
 def process_file(df):
 
-    today_col_name = datetime.today().strftime("%d-%b-%Y")
+    today_col_name = datetime.today().strftime(
+        "%d-%b-%Y"
+    )
 
     df = safe_rename_column(
         df,
@@ -51,7 +182,7 @@ def process_file(df):
 
     if "Type" not in df.columns:
         raise ValueError(
-            "Input file must contain column 'Type'"
+            "Input file must contain column Type"
         )
 
     df = df[
@@ -60,25 +191,27 @@ def process_file(df):
         )
     ].copy()
 
-    # ==========================
-    # MONTH GROUPING
-    # ==========================
+    # ==========================================
+    # GROUP MONTH
+    # ==========================================
 
     col_month_map = {}
 
     for col in df.columns:
 
-        parsed = pd.to_datetime(
-            str(col),
-            errors="coerce",
-            dayfirst=True
-        )
+        try:
 
-        if pd.notna(parsed):
-
-            col_month_map[col] = parsed.strftime(
-                "%Y-%m"
+            dt = pd.to_datetime(
+                str(col),
+                errors="raise"
             )
+
+            col_month_map[col] = (
+                dt.strftime("%Y-%m")
+            )
+
+        except:
+            pass
 
     month_groups = defaultdict(list)
 
@@ -119,11 +252,25 @@ def process_file(df):
         axis=1
     )
 
-    groupby_cols = [
-        c
-        for c in info_cols
-        if c != "Type"
-    ]
+    # ==========================================
+    # GROUP KEY
+    # ==========================================
+
+    groupby_cols = []
+
+    if "Vendor_Code" in df_result.columns:
+        groupby_cols.append("Vendor_Code")
+
+    if "Site" in df_result.columns:
+        groupby_cols.append("Site")
+
+    if "Part_No" in df_result.columns:
+        groupby_cols.append("Part_No")
+
+    if len(groupby_cols) == 0:
+        raise ValueError(
+            "Cannot find Vendor_Code / Site / Part_No"
+        )
 
     df_result = (
         df_result
@@ -137,53 +284,86 @@ def process_file(df):
         .reset_index()
     )
 
-    # ==========================
-    # INSERT COLUMNS
-    # ==========================
+    # ==========================================
+    # CALCULATE LOGIC
+    # ==========================================
 
-    new_cols = [
-        "Status",
-        "Run_out_stock_until",
-        "RYG_PO Qty Proposal",
-        "Qty_Excess",
-        "Focus_Vendor",
-        "Control WOS(3month)_ASN",
-        "Classification",
-        "Reserved_2",
-        "Reserved_3",
-        "Reserved_4"
-    ]
+    month_cols = detect_month_columns(
+        df_result
+    )
 
-    for col in reversed(new_cols):
-
-        df_result.insert(
-            0,
-            col,
-            ""
+    df_result["Run_out_stock_until"] = (
+        df_result.apply(
+            lambda r:
+            calculate_runout(
+                r,
+                month_cols
+            ),
+            axis=1
         )
+    )
+
+    df_result["Qty_Excess"] = (
+        df_result.apply(
+            lambda r:
+            calculate_excess(
+                r,
+                month_cols
+            ),
+            axis=1
+        )
+    )
+
+    df_result["Classification"] = (
+        df_result.apply(
+            lambda r:
+            calculate_classification(
+                r,
+                month_cols
+            ),
+            axis=1
+        )
+    )
+
+    df_result["Status"] = (
+        df_result.apply(
+            calculate_status,
+            axis=1
+        )
+    )
 
     return df_result
 
 
-# ===================================
-# FILE UPLOAD
-# ===================================
+# =====================================================
+# UPLOAD
+# =====================================================
 
 uploaded_file = st.file_uploader(
     "Upload Excel File",
-    type=["xlsx", "xls"]
+    type=["xlsx", "xls", "xlsb"]
 )
 
 if uploaded_file:
 
     try:
 
-        with st.spinner("Reading file..."):
+        with st.spinner(
+            "Reading file..."
+        ):
 
-            df = pd.read_excel(
-                uploaded_file,
-                keep_default_na=False
-            )
+            if uploaded_file.name.endswith(".xlsb"):
+
+                df = pd.read_excel(
+                    uploaded_file,
+                    engine="pyxlsb"
+                )
+
+            else:
+
+                df = pd.read_excel(
+                    uploaded_file
+                )
 
         st.success(
             f"Loaded {len(df):,} rows"
@@ -206,7 +386,7 @@ if uploaded_file:
             )
 
             st.dataframe(
-                result.head(),
+                result.head(20),
                 use_container_width=True
             )
 
@@ -219,8 +399,8 @@ if uploaded_file:
 
                 result.to_excel(
                     writer,
-                    sheet_name="Result",
-                    index=False
+                    index=False,
+                    sheet_name="Result"
                 )
 
             today_str = datetime.today().strftime(
@@ -237,3 +417,4 @@ if uploaded_file:
     except Exception as e:
 
         st.error(str(e))
+
